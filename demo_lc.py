@@ -2,6 +2,11 @@ import torch
 
 from pi3.models.pi3 import Pi3
 from inference_engine import StreamingWindowEngineLC
+from inference_engine.segmentation_config import (
+    add_cli_arguments,
+    describe_config,
+    resolve_from_args,
+)
 from vggt.utils.load_fn import load_and_preprocess_images
 from eval.save_func import save_for_viser
 from loop_closure.loop_closure import LoopClosureEngine
@@ -30,14 +35,21 @@ def get_args_parser():
     parser.add_argument('--output_path', default='./viser_results', type=str,
                         help='output visualization results')
     parser.add_argument('--sample_interval', default=1, type=int, help='sequence sample interval')
-    parser.add_argument('--window_size', default=10, type=int, help='sliding window size')
-    parser.add_argument('--overlap', default=5, type=int, help='sliding window overlap size')
-    parser.add_argument('--depth_refine', action='store_true', help='enable depth refine')
+    # IDEA-001: window/overlap/depth_refine are locked in configs/segmentation_config.yaml so that
+    # the loop-closure path and the canonical path are comparable. The old flags were removed so
+    # that passing them fails loudly instead of being silently ignored.
+    add_cli_arguments(parser)
 
     return parser
 
 
 def load_model(args):
+    # IDEA-001: same locked parameter source as demo.py. The loop-closure path is the second-layer
+    # question of the comparison, so it must run with the identical schedule and, in particular,
+    # with `depth_refine` enabled from the config rather than the class default of False.
+    segmentation, diagnostics = resolve_from_args(args)
+    print(describe_config(segmentation, diagnostics))
+
     # model
     if args.model_ckpt:
         model = Pi3().to(device)
@@ -52,10 +64,13 @@ def load_model(args):
         model,
         inference_device=device,
         dtype=dtype,
-        window_size=args.window_size,
-        overlap=args.overlap,
+        window_size=segmentation.window_size,
+        overlap=segmentation.overlap,
         cache_root=args.cache_path,
-        depth_refine=args.depth_refine
+        depth_refine=segmentation.depth_refine,
+        top_conf_percentile=1.0 - segmentation.confidence_keep_ratio,
+        segmentation=segmentation,
+        diagnostics=diagnostics,
     )
 
 
@@ -136,9 +151,14 @@ if __name__ == "__main__":
         args.data_path,
         cache_path_lc,
         pi3_model,
-        args.window_size,
-        args.overlap,
-        args.sample_interval
+        model.window_size,
+        model.overlap,
+        args.sample_interval,
+        # IDEA-001: these two were previously omitted, so the loop-constraint registration ran
+        # with `top_conf_percentile=0.5` while the streaming registration used the same value the
+        # engine was built with, and the loop detector silently ignored `sample_interval`. Both
+        # are now explicit and consistent with the streaming engine.
+        top_conf_percentile=1.0 - model.segmentation.confidence_keep_ratio,
     )
 
     cache_files = sorted(glob.glob(str(model.temp_cache_dir / 'window_cache_*.pt')),

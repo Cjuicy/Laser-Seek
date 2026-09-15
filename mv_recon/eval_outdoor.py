@@ -15,10 +15,19 @@ from utils.interfaces import infer_mv_pointclouds, infer_streaming_mv_pointcloud
 from mv_recon.utils import umeyama, accuracy, completion
 from utils.messages import set_default_arg, write_csv
 from utils.load_fn import load_and_preprocess_images
+from inference_engine.segmentation_config import (
+    describe_config,
+    resolve_from_environment,
+)
 
 # Additional models
 from inference_engine import StreamingWindowEngine
 
+# IDEA-001: retained only as a record of what this evaluator used to hard-code. The effective
+# values now come from the shared config plus the LASER_SEGMENTATION_* environment variables.
+# NOTE: this entry point was outside the IDEA-001 observation surface (`depth_refine=False`), and
+# it now follows the shared config like every other entry point, which means enabling LSA here is
+# a config change rather than a code change.
 WINDOW_SIZE = 60
 OVERLAP = 30
 TOP_CONF_PERCENTILE = 0.6
@@ -34,15 +43,19 @@ def create_pi3(cfg):
 def create_streaming_pi3(cfg):
     pretrained_model_name_or_path: str = cfg.pi3.pretrained_model_name_or_path
     pi3 = Pi3.from_pretrained(pretrained_model_name_or_path)
+    segmentation, diagnostics = resolve_from_environment()
+    print(describe_config(segmentation, diagnostics))
     model = StreamingWindowEngine(
         pi3,
         inference_device=cfg.device,
         dtype=dtype,
-        top_conf_percentile=0.3,
-        window_size=WINDOW_SIZE,
-        overlap=OVERLAP,
+        top_conf_percentile=1.0 - segmentation.confidence_keep_ratio,
+        window_size=segmentation.window_size,
+        overlap=segmentation.overlap,
         cache_root='cache/',
-        depth_refine=False
+        depth_refine=segmentation.depth_refine,
+        segmentation=segmentation,
+        diagnostics=diagnostics,
     ).eval()
     return model
 

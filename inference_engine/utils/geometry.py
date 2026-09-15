@@ -176,3 +176,124 @@ def accumulate_sim3(S1, S2):
     R = R1 @ R2
     t = s1 * R1 @ t2 + t1
     return s, R, t
+
+
+def depth_to_local_points_np(depth, intrinsic, eps=1e-8):
+    """Back-project a depth map into a local camera-coordinate point map."""
+    height, width = depth.shape
+    y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    fx = intrinsic[0, 0]
+    fy = intrinsic[1, 1]
+    cx = intrinsic[0, 2]
+    cy = intrinsic[1, 2]
+
+    points_x = (x - cx) / (fx + eps) * depth
+    points_y = (y - cy) / (fy + eps) * depth
+    return np.stack([points_x, points_y, depth], axis=-1)
+
+
+def compute_normals_cross_np(points, eps=1e-8):
+    """Estimate normals from local horizontal and vertical point differences."""
+    dx = points[:, 2:, :] - points[:, :-2, :]
+    dy = points[2:, :, :] - points[:-2, :, :]
+    dx = dx[1:-1, :, :]
+    dy = dy[:, 1:-1, :]
+
+    normals_inner = np.cross(dx, dy)
+    normals_inner = normals_inner / (
+        np.linalg.norm(normals_inner, axis=-1, keepdims=True) + eps
+    )
+    normals = np.zeros_like(points)
+    normals[1:-1, 1:-1, :] = normals_inner
+    return normals
+
+
+def compute_normals_sobel_np(points, eps=1e-8):
+    """Estimate normals with Sobel-style derivatives on a 3D point map."""
+    try:
+        import cv2
+
+        points_f = points.astype(np.float32, copy=False)
+        dx = np.stack(
+            [cv2.Sobel(points_f[..., channel], cv2.CV_32F, 1, 0, ksize=3) for channel in range(3)],
+            axis=-1,
+        )
+        dy = np.stack(
+            [cv2.Sobel(points_f[..., channel], cv2.CV_32F, 0, 1, ksize=3) for channel in range(3)],
+            axis=-1,
+        )
+    except Exception:
+        dx = np.gradient(points, axis=1)
+        dy = np.gradient(points, axis=0)
+
+    normals = np.cross(dx, dy)
+    norm = np.linalg.norm(normals, axis=-1, keepdims=True)
+    normals = normals / (norm + eps)
+    invalid = norm[..., 0] <= eps
+    if np.any(invalid):
+        fallback = compute_normals_cross_np(points, eps=eps)
+        normals[invalid] = fallback[invalid]
+    return normals
+
+
+def compute_normals_pca_np(points, depth=None, conf=None, window_size=5, eps=1e-8):
+    raise NotImplementedError("normal_method='pca' is reserved for a later ablation.")
+
+
+def compute_depth_edge_np(depth, eps=1e-8):
+    dy, dx = np.gradient(depth)
+    edge = np.sqrt(dx ** 2 + dy ** 2)
+    edge = edge - np.nanmin(edge)
+    edge = edge / (np.nanmax(edge) + eps)
+    return edge
+
+
+def compute_normal_edge_np(normals, eps=1e-8):
+    height, width, _ = normals.shape
+    edge = np.zeros((height, width), dtype=np.float32)
+    dot_x = np.sum(normals[:, :-1, :] * normals[:, 1:, :], axis=-1)
+    edge[:, :-1] += 1.0 - dot_x
+    dot_y = np.sum(normals[:-1, :, :] * normals[1:, :, :], axis=-1)
+    edge[:-1, :] += 1.0 - dot_y
+    edge = edge - np.nanmin(edge)
+    edge = edge / (np.nanmax(edge) + eps)
+    return edge
+
+
+def build_geometry_info_np(
+    depth,
+    conf=None,
+    intrinsic=None,
+    points=None,
+    normal_method="cross",
+):
+    """Build the geometry features used by geometry-aware segmentation."""
+    if points is None:
+        if intrinsic is None:
+            raise ValueError("intrinsic is required when points is None")
+        points = depth_to_local_points_np(depth, intrinsic)
+
+    if normal_method == "cross":
+        normal = compute_normals_cross_np(points)
+    elif normal_method == "sobel":
+        normal = compute_normals_sobel_np(points)
+    elif normal_method == "pca":
+        normal = compute_normals_pca_np(points, depth=depth, conf=conf)
+    else:
+        raise ValueError(f"Unknown normal_method: {normal_method}")
+
+    depth_edge = compute_depth_edge_np(depth)
+    normal_edge = compute_normal_edge_np(normal)
+    conf_edge = None
+    if conf is not None:
+        conf_edge = compute_depth_edge_np(conf)
+
+    valid_mask = np.isfinite(depth) & (depth > 0)
+    return {
+        "points": points,
+        "normal": normal,
+        "depth_edge": depth_edge,
+        "normal_edge": normal_edge,
+        "conf_edge": conf_edge,
+        "valid_mask": valid_mask,
+    }

@@ -4,13 +4,14 @@ import torch.nn as nn
 from collections import defaultdict
 import time
 
+from . import VanillaEngine
 from .streaming_window_engine import StreamingWindowEngine, STOP_SIGNAL
 from .inference_utils import (
     register_adjacent_windows,
     estimate_pseudo_depth_and_intrinsics,
     unproject_depth_to_local_points,
-    make_sp_graph,
-    refine_depth_segments
+    run_lsa_refinement,
+    make_sp_graph
 )
 from .utils.geometry import (
     homogenize_points,
@@ -30,7 +31,9 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             window_size: int = 20,
             overlap: int = 5,
             depth_refine=False,
-            cache_root: str = './cache'
+            cache_root: str = './cache',
+            segmentation=None,
+            diagnostics=None
     ):
         super().__init__(
             delegate=delegate.to(inference_device),
@@ -41,7 +44,9 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             window_size=window_size,
             overlap=overlap,
             depth_refine=depth_refine,
-            cache_root=cache_root
+            cache_root=cache_root,
+            segmentation=segmentation,
+            diagnostics=diagnostics
         )
 
     def _registration_worker(self):
@@ -55,6 +60,9 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
 
             working_window, inference_duration = item
             t_start = time.perf_counter()
+
+            if self.diagnostics is not None:
+                self.diagnostics.begin_window(self.cache_id)
 
             for key in working_window.keys():
                 if isinstance(working_window[key], torch.Tensor):
@@ -93,19 +101,20 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                 # working_window['camera_poses'] = apply_sim3_to_pose(working_window.pop('camera_poses'), s_d, R, t)
 
                 if self.depth_refine:
-                    tgt_pcd = working_window['local_points'].cpu().numpy()
-                    tgt_sp_graph = make_sp_graph(
-                        tgt_pcd[..., -1],
-                        conf_map=working_window['conf'].cpu().numpy(),
-                        top_conf_percentile=self.top_conf_percentile
-                    )
-                    working_window['scale_mask'] = refine_depth_segments(
-                        self.prev_window_cache['local_points'].cpu().numpy(),
-                        tgt_pcd,
+                    # IDEA-001 macro-step. `local_points` and `camera_poses` are still in the
+                    # local frame here because this engine defers every Sim(3) to
+                    # `aggregate_caches`, which is also why the mask is stored rather than applied.
+                    _, tgt_sp_graph, scale_mask = run_lsa_refinement(
+                        self.prev_window_cache['local_points'],
+                        working_window['local_points'],
+                        working_window['conf'],
                         self.anchor_sp_graph,
-                        tgt_sp_graph,
-                        self.overlap
+                        self.overlap,
+                        segmentation=self.segmentation,
+                        diagnostics=self.diagnostics,
+                        window_id=self.cache_id,
                     )
+                    working_window['scale_mask'] = scale_mask
             else:
                 _, intrinsic_ = estimate_pseudo_depth_and_intrinsics(working_window['local_points'])
                 ref_intrinsic = intrinsic_[0]
@@ -120,14 +129,22 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                 )
 
                 if self.depth_refine:
+                    # Overlap frames only, matching the Baseline and the canonical worker.
                     tgt_sp_graph = make_sp_graph(
-                        working_window['local_points'][..., -1].cpu().numpy(),
-                        conf_map=working_window['conf'].cpu().numpy(),
-                        top_conf_percentile=self.top_conf_percentile
+                        working_window['local_points'][:self.overlap, ..., -1].cpu().numpy(),
+                        conf_map=working_window['conf'][:self.overlap].cpu().numpy(),
+                        point_map=working_window['local_points'][:self.overlap].cpu().numpy(),
+                        segmentation=self.segmentation,
+                        diagnostics=self.diagnostics,
                     )
 
             self._update_cache(working_window, tgt_sp_graph)
             self._save_cache()
+
+            if self.diagnostics is not None:
+                # Make the per-frame observation points discoverable from `stages` before writing.
+                self.diagnostics.publish_frame_stages()
+                self.diagnostics.write_window(self.cache_id)
 
             reg_duration = time.perf_counter() - t_start
             total_process_time = inference_duration + reg_duration

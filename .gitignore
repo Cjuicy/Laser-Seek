@@ -9,6 +9,12 @@ __pycache__/
 
 # C extensions
 *.so
+# Cython-generated C++ produced by `python setup.py build_ext --inplace` (`force=True` regenerates
+# these on every build, so they are build output rather than source).
+inference_engine/utils/_segmentation_cy.cpp
+inference_engine/utils/fast_seg.cpp
+.DS_Store
+**/.DS_Store
 
 # Distribution / packaging
 .Python

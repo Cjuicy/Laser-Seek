@@ -2,6 +2,11 @@ from eval.pose_eval import eval_pose_estimation
 from eval.depth_eval import eval_mono_depth_estimation
 from pi3.models.pi3 import Pi3
 from inference_engine import VanillaEngine, StreamingWindowEngine, StreamingWindowEngineLC
+from inference_engine.segmentation_config import (
+    add_cli_arguments,
+    describe_config,
+    resolve_from_args,
+)
 from loop_closure.loop_closure import LoopClosureEngine
 from loop_closure.utils.config_utils import load_config
 from functools import partial
@@ -85,6 +90,11 @@ def get_args_parser():
 
     # output dir
     parser.add_argument('--output_dir', default='./results/tmp', type=str, help="path where to save the output")
+
+    # IDEA-001: the shared comparison arguments. Window schedule, `depth_refine` and every
+    # threshold come from configs/segmentation_config.yaml; `--segmentation_method` is the one
+    # intended independent variable, and `--segmentation_diagnostics` turns on OP-1..OP-6.
+    add_cli_arguments(parser)
     return parser
 
 
@@ -121,6 +131,11 @@ def inference_streaming_model_lc(model, imgs, img_dir, *args, **kwargs):
         model.delegate,
         model.window_size,
         model.overlap,
+        # IDEA-001: both of these were previously omitted, so the loop-constraint registration
+        # used the default 0.5 while streaming registration used 0.3, and the loop detector
+        # disregarded the pose-evaluation stride entirely.
+        args.pose_eval_stride,
+        top_conf_percentile=1.0 - model.segmentation.confidence_keep_ratio,
     )
 
     cache_files = sorted(glob.glob(str(model.temp_cache_dir / 'window_cache_*.pt')),
@@ -198,11 +213,30 @@ if __name__ == '__main__':
     model_variant = args.model
     if model_variant == 'pi3':
         pi3_main(args, VanillaEngine)
-    elif model_variant == 'streaming_pi3':
-        pi3_main(args, partial(StreamingWindowEngine, dtype=dtype, inference_device=device, window_size=20, overlap=5,
-                               top_conf_percentile=0.5))
-    elif model_variant == 'streaming_pi3_lc':
-        pi3_main(args, partial(StreamingWindowEngineLC, dtype=dtype, inference_device=device, window_size=75, overlap=30,
-                               top_conf_percentile=0.3))
+    elif model_variant in ('streaming_pi3', 'streaming_pi3_lc'):
+        # IDEA-001: one resolved configuration for both streaming variants, so the canonical and
+        # loop-closure paths of a comparison share window schedule, confidence and depth_refine.
+        # Previously each variant hard-coded its own (20/5 + 0.5 versus 75/30 + 0.3), which made
+        # them incomparable; `depth_refine` was not exposed here at all.
+        segmentation, diagnostics = resolve_from_args(args)
+        print(describe_config(segmentation, diagnostics))
+        engine_cls = (
+            StreamingWindowEngine if model_variant == 'streaming_pi3'
+            else StreamingWindowEngineLC
+        )
+        pi3_main(
+            args,
+            partial(
+                engine_cls,
+                dtype=dtype,
+                inference_device=device,
+                window_size=segmentation.window_size,
+                overlap=segmentation.overlap,
+                depth_refine=segmentation.depth_refine,
+                top_conf_percentile=1.0 - segmentation.confidence_keep_ratio,
+                segmentation=segmentation,
+                diagnostics=diagnostics,
+            ),
+        )
     else:
         raise NotImplementedError

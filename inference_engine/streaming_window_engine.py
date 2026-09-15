@@ -19,8 +19,8 @@ from .inference_utils import (
     estimate_pseudo_depth_and_intrinsics,
     unproject_depth_to_local_points,
     apply_sim3_to_pose,
+    run_lsa_refinement,
     make_sp_graph,
-    refine_depth_segments,
     sliding_window_t,
     sliding_window_l
 )
@@ -42,7 +42,9 @@ class StreamingWindowEngine(VanillaEngine):
             overlap: int = 5,
             depth_refine=True,
             cache_root: str = './cache',
-            benchmark_latency=True
+            benchmark_latency=True,
+            segmentation=None,
+            diagnostics=None
     ):
         super().__init__(
             delegate=delegate.to(inference_device)
@@ -56,6 +58,17 @@ class StreamingWindowEngine(VanillaEngine):
         self.process_device = process_device
         self.dtype = dtype
         self.depth_refine = depth_refine
+
+        # IDEA-001: one parameter source for every entry point. `segmentation=None` keeps the
+        # historical behaviour exactly, because the default config selects `method='depth'` with
+        # the Baseline's Felzenszwalb parameters and quantile rule.
+        if segmentation is None:
+            from .segmentation_config import load_segmentation_config
+
+            segmentation = load_segmentation_config()
+        self.segmentation = segmentation
+        self.diagnostics_config = diagnostics
+        self.diagnostics = None
 
         os.makedirs(cache_root, exist_ok=True)
         self.cache_dir = cache_root
@@ -142,6 +155,9 @@ class StreamingWindowEngine(VanillaEngine):
             working_window, inference_duration = item
             t_start = time.perf_counter()
 
+            if self.diagnostics is not None:
+                self.diagnostics.begin_window(self.cache_id)
+
             for key in working_window.keys():
                 if isinstance(working_window[key], torch.Tensor):
                     working_window[key] = working_window[key].squeeze(0)
@@ -178,18 +194,15 @@ class StreamingWindowEngine(VanillaEngine):
                 working_window['camera_poses'] = apply_sim3_to_pose(working_window.pop('camera_poses'), s_d, R, t)
 
                 if self.depth_refine:
-                    tgt_pcd = working_window['local_points'].cpu().numpy()
-                    tgt_sp_graph = make_sp_graph(
-                        tgt_pcd[..., -1],
-                        conf_map=working_window['conf'].cpu().numpy(),
-                        top_conf_percentile=self.top_conf_percentile
-                    )
-                    working_window['local_points'] = working_window['local_points'] * refine_depth_segments(
-                        self.prev_window_cache['local_points'].cpu().numpy(),
-                        tgt_pcd,
+                    working_window['local_points'], tgt_sp_graph, _ = run_lsa_refinement(
+                        self.prev_window_cache['local_points'],
+                        working_window['local_points'],
+                        working_window['conf'],
                         self.anchor_sp_graph,
-                        tgt_sp_graph,
-                        self.overlap
+                        self.overlap,
+                        segmentation=self.segmentation,
+                        diagnostics=self.diagnostics,
+                        window_id=self.cache_id,
                     )
             else:
                 _, intrinsic_ = estimate_pseudo_depth_and_intrinsics(working_window['local_points'])
@@ -200,14 +213,23 @@ class StreamingWindowEngine(VanillaEngine):
                 )
 
                 if self.depth_refine:
+                    # Only the overlap frames, exactly as the Baseline did. That slice is what
+                    # fixes each frame's confidence cut and therefore its merge threshold.
                     tgt_sp_graph = make_sp_graph(
-                        working_window['local_points'][..., -1].cpu().numpy(),
-                        conf_map=working_window['conf'].cpu().numpy(),
-                        top_conf_percentile=self.top_conf_percentile
+                        working_window['local_points'][:self.overlap, ..., -1].cpu().numpy(),
+                        conf_map=working_window['conf'][:self.overlap].cpu().numpy(),
+                        point_map=working_window['local_points'][:self.overlap].cpu().numpy(),
+                        segmentation=self.segmentation,
+                        diagnostics=self.diagnostics,
                     )
 
             self._update_cache(working_window, tgt_sp_graph)
             self._save_cache()
+
+            if self.diagnostics is not None:
+                # Make the per-frame observation points discoverable from `stages` before writing.
+                self.diagnostics.publish_frame_stages()
+                self.diagnostics.write_window(self.cache_id)
 
             reg_duration = time.perf_counter() - t_start
             total_process_time = inference_duration + reg_duration
@@ -218,6 +240,20 @@ class StreamingWindowEngine(VanillaEngine):
             raise RuntimeError('Cannot start a running inference engine')
 
         self.temp_cache_dir = pathlib.Path(tempfile.mkdtemp(dir=self.cache_dir))
+        # IDEA-001: the diagnostics sink lives beside the window caches of this run. It is
+        # `None` when observation is disabled, which is what keeps every observation branch
+        # inert. The observation level never influences labels, scales or point maps.
+        if self.diagnostics_config is not None and self.diagnostics_config.active:
+            from .segmentation_diagnostics import DiagnosticsSink
+
+            diagnostics_root = (
+                pathlib.Path(self.diagnostics_config.output_dir)
+                if self.diagnostics_config.output_dir
+                else self.temp_cache_dir / 'segmentation_diag'
+            )
+            self.diagnostics = DiagnosticsSink(self.diagnostics_config, diagnostics_root)
+        else:
+            self.diagnostics = None
         self._inference_thread = threading.Thread(target=self._model_inference_worker, daemon=True)
         self._registration_thread = threading.Thread(target=self._registration_worker, daemon=True)
         self._inference_thread.start()

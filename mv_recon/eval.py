@@ -12,10 +12,17 @@ from pi3.models.pi3 import Pi3
 from utils.interfaces import infer_mv_pointclouds, infer_streaming_mv_pointclouds
 from mv_recon.eval_utils import umeyama, accuracy, completion
 from utils.messages import set_default_arg, write_csv
+from inference_engine.segmentation_config import (
+    describe_config,
+    resolve_from_environment,
+)
 
 # Additional models
 from inference_engine import StreamingWindowEngine
 
+# IDEA-001: previously the engine parameters of this evaluator. They now come from the shared
+# config, so that a point-map run and a pose run of the same comparison are comparable. The values
+# below are retained only as a record of what this evaluator used to hard-code.
 WINDOW_SIZE = 20
 OVERLAP = 5
 dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -30,14 +37,21 @@ def create_pi3(cfg):
 def create_streaming_pi3(cfg):
     pretrained_model_name_or_path: str = cfg.pi3.pretrained_model_name_or_path
     pi3 = Pi3.from_pretrained(pretrained_model_name_or_path)
+    # This evaluator is Hydra-driven and cannot take the shared argparse flags, so it reads the
+    # locked configuration plus the LASER_SEGMENTATION_* environment variables.
+    segmentation, diagnostics = resolve_from_environment()
+    print(describe_config(segmentation, diagnostics))
     model = StreamingWindowEngine(
         pi3,
         inference_device=cfg.device,
         dtype=dtype,
-        window_size=WINDOW_SIZE,
-        overlap=OVERLAP,
+        window_size=segmentation.window_size,
+        overlap=segmentation.overlap,
         cache_root='cache/',
-        depth_refine=True
+        depth_refine=segmentation.depth_refine,
+        top_conf_percentile=1.0 - segmentation.confidence_keep_ratio,
+        segmentation=segmentation,
+        diagnostics=diagnostics,
     ).eval()
     return model
 

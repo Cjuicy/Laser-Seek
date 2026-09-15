@@ -2,6 +2,11 @@ import torch
 
 from pi3.models.pi3 import Pi3
 from inference_engine import StreamingWindowEngine
+from inference_engine.segmentation_config import (
+    add_cli_arguments,
+    describe_config,
+    resolve_from_args,
+)
 from utils.load_fn import load_and_preprocess_images
 from eval.save_func import save_for_viser
 
@@ -24,14 +29,26 @@ def get_args_parser():
     parser.add_argument('--output_path', default='./viser_results', type=str,
                         help='output visualization results')
     parser.add_argument('--sample_interval', default=1, type=int, help='sequence sample interval')
-    parser.add_argument('--window_size', default=10, type=int, help='sliding window size')
-    parser.add_argument('--overlap', default=5, type=int, help='sliding window overlap size')
-    parser.add_argument('--depth_refine', action='store_true', help='enable depth refine')
+    # IDEA-001: `--window_size`, `--overlap` and `--depth_refine` were removed from this entry
+    # point. They are locked in configs/segmentation_config.yaml so that runs of different entry
+    # points can be compared at all; passing the old flags now fails loudly instead of being
+    # silently ignored. Edit the config (or pass --segmentation_config) to change them.
+    add_cli_arguments(parser)
 
     return parser
 
 
 def load_model(args):
+    # IDEA-001: one parameter source for every entry point. These four values are locked by
+    # configs/segmentation_config.yaml so that a run of this demo is comparable with a run of the
+    # evaluators; `--segmentation_method` is the only intended independent variable.
+    #
+    # Note the deliberate behaviour change: the window/overlap/confidence here were previously
+    # hard-coded per entry point (this file used 10/5 and 0.3), which is exactly what made two
+    # entry points incomparable. The locked config now supplies all three.
+    segmentation, diagnostics = resolve_from_args(args)
+    print(describe_config(segmentation, diagnostics))
+
     # model
     if args.model_ckpt:
         model = Pi3().to(device)
@@ -51,11 +68,13 @@ def load_model(args):
         model,
         inference_device=device,
         dtype=dtype,
-        window_size=args.window_size,
-        overlap=args.overlap,
+        window_size=segmentation.window_size,
+        overlap=segmentation.overlap,
         cache_root=args.cache_path,
-        depth_refine=args.depth_refine,
-        top_conf_percentile=0.3
+        depth_refine=segmentation.depth_refine,
+        top_conf_percentile=1.0 - segmentation.confidence_keep_ratio,
+        segmentation=segmentation,
+        diagnostics=diagnostics,
     )
 
 

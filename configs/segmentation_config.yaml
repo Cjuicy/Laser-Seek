@@ -1,0 +1,58 @@
+# IDEA-001 locked segmentation configuration.
+#
+# Every entry point of a comparison loads this file, so that the ONLY field that differs between
+# runs is `segmentation.method`. Values are the locked decision recorded in
+# docs/dsh/ideas/IDEA-001-segmentation-method-attribution.md:
+#
+#   * Felzenszwalb 300 / 1.1 / 500 for ALL THREE methods. The Reference implementation tunes
+#     `geometry` to 200 / 1.0 / 300; inheriting that would mix a parameter change into the method
+#     comparison, so geometry's numbers produced with this file are explicitly NOT the Reference's
+#     tuned configuration.
+#   * depth_merge_thresh 0.1 for all three (the Reference uses 0.05 for geometry).
+#   * corr_iou_thresh keeps the Baseline's own two values: 0.3 intra-frame, 0.4 cross-window.
+#
+# `confidence_keep_ratio` is the COMPLEMENT of the retained fraction: the pixels kept are those
+# with conf >= quantile(conf, 1 - keep_ratio). This matches both the Reference implementation and
+# this repository's Baseline, whose engine has always computed `1 - top_conf_percentile` and used
+# it as the quantile level. The shipped 0.7 is therefore the historical `--top_conf_percentile 0.3`
+# and keeps the top 30% of pixels -- it is NOT a request to keep 70%.
+#
+# Set 0.5 to match what `eval_launch.py --model=streaming_pi3` used to hard-code, and 0.7 to match
+# what `demo.py` used to hard-code. See docs/dsh/ideas/IDEA-001-segmentation-method-attribution.md.
+
+segmentation:
+  # The single independent variable. One of: depth, geometry, atomic.
+  method: depth
+
+  confidence_keep_ratio: 0.7
+  confidence_quantile_method: nearest
+
+  corr_iou_thresh_intra: 0.3
+  corr_iou_thresh_inter: 0.4
+
+  depth_merge_thresh: 0.1
+
+  felzenszwalb:
+    scale: 300.0
+    sigma: 1.1
+    min_size: 500
+
+  geometry:
+    normal_method: cross
+    normal_threshold_degrees: 20.0
+
+  atomic:
+    split_mode: conservative
+    split_score_threshold: 0.10
+
+  irls:
+    iters: 10
+    eps: 1.0e-8
+    stop_tol: 0.05
+    clamp_min: 1.0e-6
+
+  # Engine-side knobs, locked so that entry points are mutually comparable.
+  window_size: 20
+  overlap: 5
+  depth_refine: true
+  sample_interval: 1

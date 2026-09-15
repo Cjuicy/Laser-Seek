@@ -121,6 +121,116 @@ def unproject_depth_to_local_points(depth, K):
     return local_points
 
 
+def run_lsa_refinement(
+        prev_local_points,
+        cur_local_points,
+        cur_conf,
+        anchor_sp_graph,
+        overlap,
+        segmentation=None,
+        diagnostics=None,
+        intrinsic=None,
+        window_id=None,
+):
+    """The single implementation of "segment the window, then correct its depth scales by LSA".
+
+    Both `StreamingWindowEngine._registration_worker` and
+    `StreamingWindowEngineLC._registration_worker` call this, and so does
+    `register_extrinsic_windows`. Before IDEA-001 the same sequence of calls existed three times,
+    which is why an observation point would have had to be written three times too.
+
+    Returns `(corrected_local_points, tgt_sp_graph, scale_mask)` and leaves the decision of what to
+    do with them to the caller: the canonical path multiplies immediately, the loop-closure path
+    stores the mask for `aggregate_caches` because it defers every Sim(3) to aggregation.
+
+    Observation points inserted here:
+
+    * OP-1 / OP-2 — emitted inside `make_sp_graph` through the segmentation diagnostics.
+    * OP-3 / OP-4 / OP-5 — emitted inside `align_adjacent_windows_depth_segments`.
+    * OP-6 — the overlap depth-consistency measurement *before* and *after* the mask. This is the
+      only genuinely new computation in the instrumentation, and it is the cheapest available
+      falsification of "the gain travels through LSA": if the correction does not make the two
+      windows agree on the shared frames, any ATE improvement comes from elsewhere.
+
+    With `diagnostics=None` (the default) no extra work is done and the returned tensors are
+    identical to the pre-IDEA-001 code path.
+    """
+    from .utils.lsa import segmentation_config_or_default
+
+    segmentation = segmentation_config_or_default(segmentation)
+
+    irls_kwargs = {
+        "iters": segmentation.irls.iters,
+        "eps": segmentation.irls.eps,
+        "stop_tol": segmentation.irls.stop_tol,
+        "clamp_min": segmentation.irls.clamp_min,
+    }
+
+    tgt_pcd = cur_local_points.cpu().numpy()
+    tgt_conf = cur_conf.cpu().numpy() if cur_conf is not None else None
+    if tgt_conf is not None:
+        # The Baseline sees only the OVERLAP frames' confidence. That slice is what fixes each
+        # frame's confidence cut, hence each frame's high-confidence depth range, hence each
+        # frame's merge threshold. Passing the whole window instead computes one threshold from
+        # the window's full depth range, which can be an order of magnitude larger for a near
+        # frame that shares a window with distant geometry.
+        tgt_conf = tgt_conf[:overlap]
+
+    tgt_sp_graph = make_sp_graph(
+        tgt_pcd[..., -1],
+        conf_map=tgt_conf,
+        point_map=tgt_pcd,
+        intrinsic=None if intrinsic is None else (
+            intrinsic.cpu().numpy() if hasattr(intrinsic, "cpu") else np.asarray(intrinsic)
+        ),
+        segmentation=segmentation,
+        diagnostics=diagnostics,
+    )
+
+    before = None
+    if diagnostics is not None:
+        from .segmentation_diagnostics import overlap_depth_consistency
+
+        before = overlap_depth_consistency(
+            source_points=prev_local_points[-overlap:].cpu().numpy(),
+            target_points=tgt_pcd[:overlap],
+            stride=4,
+        )
+
+    scale_mask = refine_depth_segments(
+        prev_local_points.cpu().numpy(),
+        tgt_pcd,
+        anchor_sp_graph,
+        tgt_sp_graph,
+        overlap,
+        corr_iou_thresh=segmentation.corr_iou_thresh_inter,
+        irls=irls_kwargs,
+        diagnostics=diagnostics,
+    )
+
+    if diagnostics is not None:
+        from .segmentation_diagnostics import (
+            OP_OVERLAP_CONSISTENCY,
+            mask_consistency_delta,
+            overlap_depth_consistency,
+        )
+        from .utils.lsa import record_scale_mask
+
+        after = overlap_depth_consistency(
+            source_points=prev_local_points[-overlap:].cpu().numpy(),
+            target_points=(cur_local_points * scale_mask.to(cur_local_points.device))
+            .cpu().numpy()[:overlap],
+            stride=4,
+        )
+        diagnostics.record_stage(
+            OP_OVERLAP_CONSISTENCY,
+            mask_consistency_delta(before, after),
+        )
+        record_scale_mask(scale_mask.cpu().numpy(), diagnostics)
+
+    return cur_local_points * scale_mask.to(cur_local_points.device), tgt_sp_graph, scale_mask
+
+
 def register_extrinsic_windows(
         pcd_windows,
         cam_windows,

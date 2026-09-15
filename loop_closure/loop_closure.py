@@ -10,6 +10,7 @@ from utils.load_fn import load_and_preprocess_images
 from pi3.models.pi3 import Pi3
 from inference_engine import StreamingWindowEngine
 from inference_engine.inference_utils import register_adjacent_windows
+from inference_engine.segmentation_config import resolve_from_environment
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -224,6 +225,10 @@ if __name__ == '__main__':
     pi3_model = Pi3.from_pretrained("yyfz233/Pi3").to(device)
 
     config = load_config(args.config_path)
+    # IDEA-001: the loop-constraint registration must use the same confidence rule as the streaming
+    # registration it corrects. It previously inherited the constructor default, which silently
+    # differed from the streaming engine's value.
+    segmentation, _diagnostics = resolve_from_environment()
     loop_closure = LoopClosureEngine(
         config,
         args.data_path,
@@ -231,6 +236,7 @@ if __name__ == '__main__':
         pi3_model,
         args.window_size,
         args.overlap,
+        top_conf_percentile=1.0 - segmentation.confidence_keep_ratio,
     )
 
     cache_files = sorted(glob.glob(str(Path(args.cache_path) / 'window_cache_*.pt')),
